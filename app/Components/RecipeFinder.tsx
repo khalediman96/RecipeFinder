@@ -1,6 +1,6 @@
 "use client";
 import axios from 'axios';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ChefHat, Search, RefreshCw } from 'lucide-react';
@@ -24,7 +24,6 @@ interface EdamamResponse {
   hits: { recipe: Recipe }[];
 }
 
-// Define interface for Axios error
 interface AxiosError extends Error {
   response?: {
     status: number;
@@ -32,19 +31,66 @@ interface AxiosError extends Error {
   };
 }
 
+// Cache interface
+interface CacheItem {
+  data: Recipe[];
+  timestamp: number;
+}
+
+const CACHE_EXPIRY = 30 * 60 * 1000; // 30 minutes in milliseconds
+const RATE_LIMIT_DELAY = 1000; // 1 second between requests
+
 const RecipeFinder: React.FC = () => {
   const [ingredients, setIngredients] = useState<string>('');
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastRequestTime, setLastRequestTime] = useState<number>(0);
   const router = useRouter();
 
-  // Fixed environment variable access for client-side
   const APP_ID = process.env.NEXT_PUBLIC_EDAMAM_APP_ID;
   const APP_KEY = process.env.NEXT_PUBLIC_EDAMAM_APP_KEY;
-  
-  // Fixed API URL - using the correct endpoint
   const API_URL = 'https://api.edamam.com/api/recipes/v2';
+
+  // Get cached data for a query
+  const getCachedRecipes = (query: string): Recipe[] | null => {
+    if (typeof window === 'undefined') return null;
+    
+    const cacheKey = `recipe_cache_${query.toLowerCase().trim()}`;
+    const cachedData = localStorage.getItem(cacheKey);
+    
+    if (!cachedData) return null;
+    
+    try {
+      const parsedCache: CacheItem = JSON.parse(cachedData);
+      const now = Date.now();
+      
+      // Check if cache is expired
+      if (now - parsedCache.timestamp > CACHE_EXPIRY) {
+        localStorage.removeItem(cacheKey);
+        return null;
+      }
+      
+      return parsedCache.data;
+    } catch (e) {
+      console.error('Error parsing cache', e);
+      localStorage.removeItem(cacheKey);
+      return null;
+    }
+  };
+
+  // Store data in cache
+  const cacheRecipes = (query: string, data: Recipe[]) => {
+    if (typeof window === 'undefined') return;
+    
+    const cacheKey = `recipe_cache_${query.toLowerCase().trim()}`;
+    const cacheItem: CacheItem = {
+      data,
+      timestamp: Date.now()
+    };
+    
+    localStorage.setItem(cacheKey, JSON.stringify(cacheItem));
+  };
 
   const handleSearch = async () => {
     if (!ingredients.trim()) {
@@ -57,6 +103,23 @@ const RecipeFinder: React.FC = () => {
       return;
     }
 
+    // Check cache first
+    const cachedRecipes = getCachedRecipes(ingredients);
+    if (cachedRecipes) {
+      setRecipes(cachedRecipes);
+      localStorage.setItem('searchResults', JSON.stringify(cachedRecipes));
+      return;
+    }
+
+    // Rate limiting
+    const now = Date.now();
+    const timeSinceLastRequest = now - lastRequestTime;
+    
+    if (timeSinceLastRequest < RATE_LIMIT_DELAY) {
+      const delay = RATE_LIMIT_DELAY - timeSinceLastRequest;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+
     setLoading(true);
     setError(null);
     
@@ -67,20 +130,18 @@ const RecipeFinder: React.FC = () => {
           app_id: APP_ID,
           app_key: APP_KEY,
           q: ingredients.trim(),
-          // Fixed: 'field' should be 'fields' and should be a comma-separated string
           fields: 'label,image,ingredientLines,url,yield,totalTime,cuisineType,mealType,dishType,source,calories',
-          // Optional: add more specific parameters
           from: 0,
-          to: 12, // Limit results
+          to: 12,
         },
-        timeout: 15000, // Increased timeout
+        timeout: 15000,
         headers: {
           'Accept': 'application/json',
           'Content-Type': 'application/json',
         }
       });
 
-      console.log('API Response:', response.data); // For debugging
+      console.log('API Response:', response.data);
 
       if (!response.data?.hits || !Array.isArray(response.data.hits)) {
         throw new Error('Invalid API response: No recipes found or unexpected response format');
@@ -94,9 +155,13 @@ const RecipeFinder: React.FC = () => {
 
       const validRecipes = response.data.hits
         .map(hit => hit.recipe)
-        .filter(recipe => recipe && recipe.label && recipe.image); // Filter out invalid recipes
+        .filter(recipe => recipe && recipe.label && recipe.image);
 
       setRecipes(validRecipes);
+      setLastRequestTime(Date.now());
+      
+      // Cache the results
+      cacheRecipes(ingredients, validRecipes);
       
       // Store recipes in localStorage for the detail page to access
       if (typeof window !== 'undefined') {
@@ -110,12 +175,7 @@ const RecipeFinder: React.FC = () => {
     } catch (error) {
       const axiosError = error as AxiosError;
       console.error('Error fetching recipes:', axiosError);
-      console.error('Error details:', {
-        message: axiosError.message,
-        response: axiosError.response?.data ?? null,
-        status: axiosError.response?.status ?? null,
-      });
-
+      
       let errorMessage = 'Failed to fetch recipes. Please try again.';
       
       if (axiosError.response) {
@@ -176,9 +236,9 @@ const RecipeFinder: React.FC = () => {
   const createRecipeSlug = (label: string, index: number): string => {
     return `${label
       .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, '') // Remove special characters
-      .replace(/\s+/g, '-') // Replace spaces with hyphens
-      .replace(/-+/g, '-') // Replace multiple hyphens with single
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
       .trim()}-${index}`;
   };
 
